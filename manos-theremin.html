@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Manos Theremin</title>
+<!--
+  Instrumento controlado con las manos: cámara -> MediaPipe HandLandmarker -> notas -> Web Audio.
+  Uso: abrir en Chrome/Edge de escritorio y permitir la cámara.
+  Si el navegador bloquea la cámara al abrirlo como archivo, servirlo en local:
+      python3 -m http.server 8000     y abrir  http://localhost:8000/manos-theremin.html
+-->
+<style>
+  :root{--bg:#0b0a09;--fg:#f1e6d3;--ac:#f0a64a;--mut:#8a7f70}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.4 ui-monospace,Menlo,Consolas,monospace}
+  #app{height:100%;display:flex;flex-direction:column}
+  #bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid #2a2520}
+  button,select{background:#1a1612;color:var(--fg);border:1px solid #3a3228;border-radius:6px;padding:7px 10px;font:inherit}
+  button.primary{background:var(--ac);color:#1a1209;border-color:var(--ac);font-weight:700;cursor:pointer}
+  label{color:var(--mut)}
+  #stage{position:relative;flex:1;min-height:0;display:flex;justify-content:center;align-items:center}
+  canvas{max-width:100%;max-height:100%;background:#000}
+  #msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;color:var(--mut);pointer-events:none}
+  #help{padding:8px 12px;border-top:1px solid #2a2520;color:var(--mut);font-size:12px}
+  video{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <button id="start" class="primary">Iniciar cámara y sonido</button>
+    <label>Nota base <select id="root"></select></label>
+    <label>Escala
+      <select id="scale">
+        <option value="mayor">Mayor</option>
+        <option value="menor">Menor</option>
+        <option value="dorica">Dórica</option>
+        <option value="pentatonica">Pentatónica</option>
+        <option value="blues">Blues</option>
+      </select>
+    </label>
+    <label>Timbre
+      <select id="wave">
+        <option value="triangle">Triángulo</option>
+        <option value="sine">Seno</option>
+        <option value="square">Cuadrada</option>
+        <option value="sawtooth">Sierra</option>
+      </select>
+    </label>
+  </div>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="msg">Pulsá “Iniciar” y permití el acceso a la cámara.</div>
+  </div>
+  <div id="help">
+    Mano derecha = melodía: cantidad de dedos levantados (1–5) elige la nota, la altura de la mano sube el registro, puño = silencio.
+    Mano izquierda = acordes: cantidad de dedos elige el grado, la altura abre/cierra el filtro.
+  </div>
+</div>
+<video id="vid" playsinline muted></video>
+
+<script type="module">
+import {HandLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d"), video = $("vid"), msg = $("msg");
+const NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const SCALES = {
+  mayor:[0,2,4,5,7,9,11], menor:[0,2,3,5,7,8,10], dorica:[0,2,3,5,7,9,10],
+  pentatonica:[0,2,4,7,9], blues:[0,3,5,6,7,10]
+};
+NAMES.forEach((n,i)=>{ const o=document.createElement("option"); o.value=i; o.textContent=n; $("root").appendChild(o); });
+
+const mtof = m => 440 * 2 ** ((m - 69) / 12);
+const noteName = m => NAMES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+function scaleNote(base, idx){
+  const s = SCALES[$("scale").value], n = s.length;
+  return base + s[((idx % n) + n) % n] + 12 * Math.floor(idx / n);
+}
+
+/* ---------- Audio ---------- */
+let ac, master, analyser, lead, pad;
+function initAudio(){
+  ac = new AudioContext();
+  const comp = ac.createDynamicsCompressor();
+  const bus = ac.createGain();
+  const dly = ac.createDelay(1); dly.delayTime.value = .28;
+  const fb = ac.createGain(); fb.gain.value = .35;
+  const wet = ac.createGain(); wet.gain.value = .25;
+  bus.connect(comp); bus.connect(dly);
+  dly.connect(fb); fb.connect(dly); dly.connect(wet); wet.connect(comp);
+  master = ac.createGain(); master.gain.value = .8;
+  analyser = ac.createAnalyser(); analyser.fftSize = 2048;
+  comp.connect(master); master.connect(analyser); analyser.connect(ac.destination);
+
+  const lo = ac.createOscillator(); lo.type = $("wave").value; lo.frequency.value = 440;
+  const lg = ac.createGain(); lg.gain.value = 0;
+  lo.connect(lg); lg.connect(bus); lo.start();
+  lead = {osc: lo, gain: lg};
+
+  const pf = ac.createBiquadFilter(); pf.type = "lowpass"; pf.frequency.value = 1200; pf.Q.value = 2;
+  const pg = ac.createGain(); pg.gain.value = 0;
+  pf.connect(pg); pg.connect(bus);
+  const voices = [0,1,2].map(i => {
+    const o = ac.createOscillator(); o.type = "sawtooth"; o.detune.value = (i - 1) * 7;
+    const g = ac.createGain(); g.gain.value = .5;
+    o.connect(g); g.connect(pf); o.start(); return o;
+  });
+  pad = {voices, filter: pf, gain: pg};
+}
+const leadOn = m => { const t = ac.currentTime; lead.osc.frequency.setTargetAtTime(mtof(m), t, .012); lead.gain.gain.setTargetAtTime(.32, t, .02); };
+const leadOff = () => lead.gain.gain.setTargetAtTime(0, ac.currentTime, .1);
+const padOn = notes => { const t = ac.currentTime; notes.forEach((m,i) => pad.voices[i].frequency.setTargetAtTime(mtof(m), t, .03)); pad.gain.gain.setTargetAtTime(.2, t, .05); };
+const padOff = () => pad.gain.gain.setTargetAtTime(0, ac.currentTime, .2);
+$("wave").onchange = () => { if (lead) lead.osc.type = $("wave").value; };
+
+/* ---------- Gestos ---------- */
+let AR = 16 / 9;
+const d = (a, b) => Math.hypot((a.x - b.x) * AR, a.y - b.y);
+function fingers(lm){
+  let n = 0;
+  for (const [tip, pip] of [[8,6],[12,10],[16,14],[20,18]])
+    if (d(lm[tip], lm[0]) > d(lm[pip], lm[0]) * 1.08) n++;
+  if (d(lm[4], lm[17]) > d(lm[2], lm[17]) * 1.1) n++;   // pulgar
+  return n;
+}
+const band = y => clamp(Math.floor((0.78 - y) / 0.14), 0, 3);   // 4 zonas de altura
+
+// anti-parpadeo: un valor se confirma tras N frames iguales seguidos
+const st = {};
+function stable(key, val, frames = 3){
+  const s = st[key] ??= {cur: "off", cand: null, n: 0};
+  if (val === s.cand) s.n++; else { s.cand = val; s.n = 1; }
+  if (s.n >= frames) s.cur = val;
+  return s.cur;
+}
+
+/* ---------- Visión ---------- */
+let landmarker = null, lastT = -1, lastRes = null;
+async function initVision(){
+  const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = delegate => ({
+    baseOptions: {modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate},
+    runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: .6, minTrackingConfidence: .5
+  });
+  try { landmarker = await HandLandmarker.createFromOptions(fs, opts("GPU")); }
+  catch { landmarker = await HandLandmarker.createFromOptions(fs, opts("CPU")); }
+}
+
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  try {
+    msg.textContent = "Pidiendo cámara…";
+    if (!ac) initAudio();
+    await ac.resume();
+    video.srcObject = await navigator.mediaDevices.getUserMedia({video: {width: 1280, height: 720, facingMode: "user"}, audio: false});
+    await video.play();
+    cv.width = video.videoWidth; cv.height = video.videoHeight; AR = cv.width / cv.height;
+    msg.textContent = "Cargando modelo de manos…";
+    await initVision();
+    msg.textContent = "";
+    $("start").textContent = "Funcionando";
+    requestAnimationFrame(frame);
+  } catch (e) {
+    msg.textContent = "Error: " + (e.message || e) + " — revisá permisos de cámara o abrí la página desde http://localhost.";
+    $("start").disabled = false;
+  }
+};
+
+/* ---------- Loop ---------- */
+function frame(){
+  requestAnimationFrame(frame);
+  if (!landmarker || video.readyState < 2) return;
+  const W = cv.width, H = cv.height;
+
+  // video espejado; el modelo recibe la imagen espejada, así "Left"/"Right" = tus manos reales
+  ctx.save(); ctx.scale(-1, 1); ctx.drawImage(video, -W, 0, W, H); ctx.restore();
+  if (video.currentTime !== lastT) { lastT = video.currentTime; lastRes = landmarker.detectForVideo(cv, performance.now()); }
+  const res = lastRes;
+
+  const hands = {Left: null, Right: null};
+  if (res) {
+    const hd = res.handedness || res.handednesses || [];
+    res.landmarks.forEach((lm, i) => { const lab = hd[i]?.[0]?.categoryName; if (lab && !hands[lab]) hands[lab] = lm; });
+  }
+  const root = +$("root").value;
+
+  // derecha: melodía
+  const R = hands.Right;
+  const rc = R ? fingers(R) : 0, rb = R ? band(R[9].y) : 0;
+  const rs = stable("R", R && rc > 0 ? rc + "|" + rb : "off");
+  let leadTxt = "—", rInfo = R ? `${rc} dedos · zona ${rb + 1}` : "sin mano";
+  if (rs !== "off") {
+    const [c, b] = rs.split("|").map(Number);
+    const m = scaleNote(60 + root, c - 1 + b * 2);
+    leadOn(m); leadTxt = noteName(m);
+  } else leadOff();
+
+  // izquierda: acordes + filtro
+  const L = hands.Left;
+  const lc = L ? fingers(L) : 0;
+  const ls = stable("L", L && lc > 0 ? String(lc) : "off");
+  let chordTxt = "—", lInfo = L ? `${lc} dedos` : "sin mano";
+  if (ls !== "off") {
+    const c = +ls, base = 48 + root;
+    const notes = [0, 2, 4].map(k => scaleNote(base, c - 1 + k));
+    padOn(notes); chordTxt = noteName(notes[0]).replace(/\d/, "");
+    const cutoff = 250 * Math.pow(16, clamp((0.85 - L[9].y) / 0.6, 0, 1));
+    pad.filter.frequency.setTargetAtTime(cutoff, ac.currentTime, .05);
+  } else padOff();
+
+  /* ---- overlay ---- */
+  ctx.fillStyle = "rgba(0,0,0,.35)"; ctx.fillRect(0, 0, W, H);
+  ctx.font = `${Math.round(H / 48)}px ui-monospace,monospace`;
+  ctx.strokeStyle = "rgba(240,166,74,.18)"; ctx.fillStyle = "rgba(240,166,74,.6)"; ctx.lineWidth = 1;
+  ctx.setLineDash([6, 8]);
+  for (let k = 0; k <= 3; k++) {            // guías de altura
+    const y = (0.78 - 0.14 * k) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.textAlign = "right"; ctx.fillText(`zona ${k + 1}`, W - 8, y - 6);
+  }
+  ctx.setLineDash([]);
+
+  const conns = HandLandmarker.HAND_CONNECTIONS || [];
+  for (const lm of [hands.Left, hands.Right]) {
+    if (!lm) continue;
+    ctx.strokeStyle = "rgba(240,166,74,.55)"; ctx.lineWidth = 2;
+    for (const c of conns) {
+      ctx.beginPath(); ctx.moveTo(lm[c.start].x * W, lm[c.start].y * H); ctx.lineTo(lm[c.end].x * W, lm[c.end].y * H); ctx.stroke();
+    }
+    ctx.fillStyle = "#fff";
+    for (const p of lm) { ctx.beginPath(); ctx.arc(p.x * W, p.y * H, 3.5, 0, 7); ctx.fill(); }
+  }
+
+  // forma de onda
+  if (analyser) {
+    const buf = new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(buf);
+    ctx.strokeStyle = "#f0a64a"; ctx.lineWidth = 2.5; ctx.beginPath();
+    const yc = H * 0.9, amp = H * 0.07;
+    for (let i = 0; i < buf.length; i += 4) {
+      const x = i / buf.length * W, y = yc + (buf[i] - 128) / 128 * amp * 3;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // textos
+  ctx.fillStyle = "#f1e6d3"; ctx.textAlign = "center";
+  ctx.font = `700 ${Math.round(H / 10)}px ui-monospace,monospace`; ctx.fillText(leadTxt, W / 2, H * 0.86);
+  ctx.font = `${Math.round(H / 38)}px ui-monospace,monospace`;
+  ctx.fillStyle = "#8a7f70"; ctx.textAlign = "left";  ctx.fillText(`IZQ · acorde ${chordTxt} · ${lInfo}`, 12, H * 0.05);
+  ctx.textAlign = "right"; ctx.fillText(`DER · ${rInfo}`, W - 12, H * 0.05);
+}
+</script>
+</body>
+</html>
